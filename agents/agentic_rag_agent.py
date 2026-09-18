@@ -2,6 +2,9 @@
 """
 Lab 4 - Agentic RAG (model-driven, via native tool-calling)
 
+The MODEL drives the loop: using native tool-calling it decides which tools to
+call, retrieves as needed, grounds office names to real cities, and a self-check
+gate verifies the answer is grounded before finishing.
 
 You build this file with the diff/merge step. FOUR sections are merged in, each
 marked with a ">>>>> MERGE SECTION N" banner:
@@ -66,7 +69,11 @@ def haversine_miles(lat1, lon1, lat2, lon2):
     return R * 2 * math.atan2(math.sqrt(h), math.sqrt(1 - h))
 
 
-
+# >>>>> MERGE SECTION 1: tools the agent can call (+ grounding helper) >>>>>
+# search_documents -> RAG retrieval (the model may call it again with a better query)
+# ground_office    -> resolve an office name to its real city from the docs
+#                     (e.g. "HQ" -> "New York"), or report not_found - never invents one
+# distance_to / city_facts -> live tools.  DISPATCH maps a tool name to its function.
 def search_documents(args, state):
     query = args.get("query", "")
     snippets = collection.query(query_texts=[query], n_results=3)["documents"][0]
@@ -78,6 +85,8 @@ def search_documents(args, state):
 
 
 def ground_office(place, state):
+    """Match an office name to a retrieved doc line and return its real city,
+    or not_found - so the agent can't invent an office that isn't in the data."""
     snippets = collection.query(query_texts=[place], n_results=3)["documents"][0]
     for s in snippets:
         if s not in state["retrieved"]:
@@ -110,6 +119,9 @@ def city_facts(args, state):
     g = ground_office(args.get("city") or args.get("office") or "", state)
     if g["status"] == "not_found":
         return {"error": "no such office", "available_offices": g["available_offices"]}
+    messages = [{"role": "system", "content": "Give exactly 3 short facts, one per line starting with '-'."},
+                {"role": "user", "content": f"Three facts about {g['city']}."}]
+    out = client.chat.completions.create(model=MODEL, messages=messages).choices[0].message.content
     facts = [line.lstrip("- ").strip() for line in out.splitlines() if line.strip().startswith("-")][:3]
     return {"city": g["city"], "facts": facts}
 
@@ -118,6 +130,9 @@ DISPATCH = {"search_documents": search_documents, "distance_to": distance_to, "c
 # >>>>> END MERGE SECTION 1 >>>>>
 
 
+# >>>>> MERGE SECTION 2: tool schemas (enable native tool-calling) + system prompt >>>>>
+# TOOLS_SCHEMA is the standard OpenAI-style tool schema. We pass it straight to the
+# model with tools=... and read the calls the model chose back from message.tool_calls.
 TOOLS_SCHEMA = [
     {"type": "function", "function": {"name": "search_documents",
         "description": "Retrieve office-document snippets. Call first; call again with a better query if needed.",
@@ -131,21 +146,42 @@ TOOLS_SCHEMA = [
 ]
 
 SYSTEM = (
+    "You answer questions about company offices using ONLY the office documents. "
+    "Always call search_documents FIRST. Answer ONLY what was asked - do not list other "
+    "offices or call distance_to/city_facts for offices the user did not mention. "
+    "For 'tell me about <office>', search that office and describe it (its city and snippet); "
+    "compute distance only if asked. For 'which is closer', call distance_to for each office. "
+    "Never substitute a similarly named office for the one the user asked about - if the exact "
+    "office the user named is not in the documents, say that, even if a close name exists. "
+    'If a tool returns {"error": ..., "available_offices": [...]}, say that office does not exist '
+    "and list the ones that do - never invent one. Keep answers concise; finish with plain text.")
 # >>>>> END MERGE SECTION 2 >>>>>
 
 
 # >>>>> MERGE SECTION 3: self-check gate >>>>>
+# Deterministic check: accept a non-empty answer that is grounded (documents were
+# retrieved). It does NOT require listing every office - a focused question gets a
+# focused answer - so it never forces needless extra retrieval.
 def validate_answer(answer, state):
+    if not (answer or "").strip():
+        return {"complete": False, "missing": "the answer is empty"}
+    if not state["retrieved"]:
+        return {"complete": False, "missing": "no documents retrieved - search first"}
     return {"complete": True, "missing": ""}
 # >>>>> END MERGE SECTION 3 >>>>>
 
 
 # >>>>> MERGE SECTION 4: the agent loop (the MODEL drives it) >>>>>
-# TODO (merge): run_agent - the model decides each step (call tools, or final answer)
+# Each step the model either (a) calls tools - we run them and feed the results
+# back - or (b) gives a final answer, which we run through the self-check.
 def run_agent(user_query, start, max_steps=8):
     state = {"start": start, "retrieved": []}
     messages = [{"role": "system", "content": SYSTEM},
                 {"role": "user", "content": f"My starting location is {start['city']}. {user_query}"}]
+    for step in range(1, max_steps + 1):
+        print(f"\n[AGENT] step {step}: asking the model what to do...")
+        # Native tool-calling: hand the model the tool schemas; it replies either with
+        # tool calls to run (message.tool_calls) or with a final plain-text answer.
         resp = client.chat.completions.create(
             model=MODEL, messages=messages, tools=TOOLS_SCHEMA, tool_choice="auto", temperature=0)
         message = resp.choices[0].message
@@ -156,6 +192,15 @@ def run_agent(user_query, start, max_steps=8):
             messages.append({"role": "assistant", "content": message.content or "", "tool_calls": [
                 {"id": tc.id, "type": "function",
                  "function": {"name": tc.function.name, "arguments": tc.function.arguments}} for tc in message.tool_calls]})
+            for tc in message.tool_calls:
+                try:
+                    args = json.loads(tc.function.arguments or "{}")
+                except Exception:
+                    args = {}
+                print(f"    [AGENT decision] call {tc.function.name}({json.dumps(args)})")
+                result = DISPATCH.get(tc.function.name, lambda a, s: {"error": "unknown tool"})(args, state)
+                print(f"    [observation] {json.dumps(result)[:200]}")
+                messages.append({"role": "tool", "tool_call_id": tc.id, "content": json.dumps(result)})
             continue
 
         # No tool call -> the model gave its final answer
